@@ -2,20 +2,33 @@ import os
 import time
 import urllib.request
 from collections import deque, Counter
+import warnings
 
 import cv2
 import joblib
 import mediapipe as mp
 import numpy as np
 
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
+
 MODEL_PATH = "hand_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+
 CLASSIFIER_PATH = "fsl_model.joblib"
+MOTION_MODEL_PATH = "fsl_motion_model.joblib"
 
 CAMERA_INDEX = 0
 
+SEQUENCE_LENGTH = 30
+STATIC_CONFIDENCE_THRESHOLD = 0.60
+MOTION_CONFIDENCE_THRESHOLD = 0.75
+MOTION_MOVEMENT_THRESHOLD = 0.15
+
+# How long J/Z stays on screen after detection
+MOTION_HOLD_SECONDS = 3.0
+
 if not os.path.exists(CLASSIFIER_PATH):
-    print("No trained model found. Run collect_data.py first, then train_model.py.")
+    print("No trained static model found. Run collect_data.py first, then train_model.py.")
     exit()
 
 if not os.path.exists(MODEL_PATH):
@@ -24,6 +37,13 @@ if not os.path.exists(MODEL_PATH):
     print("Model downloaded.")
 
 classifier = joblib.load(CLASSIFIER_PATH)
+
+motion_classifier = None
+if os.path.exists(MOTION_MODEL_PATH):
+    motion_classifier = joblib.load(MOTION_MODEL_PATH)
+    print("Motion model loaded. J and Z detection enabled.")
+else:
+    print("No motion model found. J and Z movement detection disabled.")
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -49,6 +69,8 @@ options = HandLandmarkerOptions(
 )
 
 prediction_history = deque(maxlen=10)
+motion_buffer = deque(maxlen=SEQUENCE_LENGTH)
+
 
 def normalize_landmarks(hand_landmarks):
     wrist = hand_landmarks[0]
@@ -59,6 +81,7 @@ def normalize_landmarks(hand_landmarks):
     scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
 
     features = []
+
     for lm in hand_landmarks:
         features.extend([
             (lm.x - wrist.x) / scale,
@@ -68,12 +91,64 @@ def normalize_landmarks(hand_landmarks):
 
     return features
 
+
+def raw_landmarks(hand_landmarks):
+    return [(lm.x, lm.y, lm.z) for lm in hand_landmarks]
+
+
+def sequence_to_features(sequence):
+    first_frame = sequence[0]
+    wrist0 = first_frame[0]
+
+    xs = [p[0] for p in first_frame]
+    ys = [p[1] for p in first_frame]
+
+    scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
+
+    features = []
+
+    for frame in sequence:
+        for x, y, z in frame:
+            features.extend([
+                (x - wrist0[0]) / scale,
+                (y - wrist0[1]) / scale,
+                (z - wrist0[2]) / scale
+            ])
+
+    return features
+
+
+def calculate_movement(sequence):
+    if len(sequence) < 2:
+        return 0
+
+    first_frame = sequence[0]
+
+    xs = [p[0] for p in first_frame]
+    ys = [p[1] for p in first_frame]
+
+    scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
+
+    important_points = [0, 4, 8, 12, 16, 20]
+    max_dist = 0
+
+    for frame in sequence:
+        for point_id in important_points:
+            dx = (frame[point_id][0] - first_frame[point_id][0]) / scale
+            dy = (frame[point_id][1] - first_frame[point_id][1]) / scale
+            dist = (dx * dx + dy * dy) ** 0.5
+            max_dist = max(max_dist, dist)
+
+    return max_dist
+
+
 def get_stable_prediction():
     if not prediction_history:
         return ""
 
     most_common = Counter(prediction_history).most_common(1)
     return most_common[0][0]
+
 
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
@@ -85,6 +160,9 @@ def main():
         return
 
     frame_count = 0
+
+    last_motion_letter = ""
+    last_motion_time = 0
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -110,11 +188,25 @@ def main():
 
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-            predicted_letter = ""
-            confidence = 0
+            static_letter = ""
+            static_confidence = 0.0
+
+            motion_letter = ""
+            motion_confidence = 0.0
+            movement_score = 0.0
+
+            final_letter = ""
+
+            now = time.time()
+            motion_hold_active = (
+                last_motion_letter != ""
+                and now - last_motion_time <= MOTION_HOLD_SECONDS
+            )
 
             if result.hand_landmarks:
                 hand_landmarks = result.hand_landmarks[0]
+
+                motion_buffer.append(raw_landmarks(hand_landmarks))
 
                 points = []
 
@@ -132,20 +224,53 @@ def main():
                 probabilities = classifier.predict_proba(features)[0]
                 max_index = np.argmax(probabilities)
 
-                predicted_letter = classifier.classes_[max_index]
-                confidence = probabilities[max_index]
+                static_letter = classifier.classes_[max_index]
+                static_confidence = probabilities[max_index]
 
-                if confidence >= 0.60:
-                    prediction_history.append(predicted_letter)
+                if static_confidence >= STATIC_CONFIDENCE_THRESHOLD:
+                    prediction_history.append(static_letter)
 
-            stable_letter = get_stable_prediction()
+                stable_letter = get_stable_prediction()
+                final_letter = stable_letter
 
-            cv2.rectangle(frame, (20, 20), (420, 150), (0, 0, 0), -1)
+                if not motion_hold_active:
+                    if motion_classifier is not None and len(motion_buffer) == SEQUENCE_LENGTH:
+                        sequence = list(motion_buffer)
+                        movement_score = calculate_movement(sequence)
+
+                        if movement_score >= MOTION_MOVEMENT_THRESHOLD:
+                            motion_features = sequence_to_features(sequence)
+                            motion_features = np.array(motion_features).reshape(1, -1)
+
+                            motion_probabilities = motion_classifier.predict_proba(motion_features)[0]
+                            motion_index = np.argmax(motion_probabilities)
+
+                            motion_letter = motion_classifier.classes_[motion_index]
+                            motion_confidence = motion_probabilities[motion_index]
+
+                            if motion_letter != "NONE" and motion_confidence >= MOTION_CONFIDENCE_THRESHOLD:
+                                last_motion_letter = motion_letter
+                                last_motion_time = time.time()
+
+                                final_letter = motion_letter
+
+                                prediction_history.clear()
+                                motion_buffer.clear()
+
+                else:
+                    final_letter = last_motion_letter
+
+            else:
+                prediction_history.clear()
+                motion_buffer.clear()
+                final_letter = ""
+
+            cv2.rectangle(frame, (20, 20), (620, 190), (0, 0, 0), -1)
 
             cv2.putText(
                 frame,
-                f"Detected Letter: {stable_letter}",
-                (40, 80),
+                f"Detected Letter: {final_letter}",
+                (40, 75),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.2,
                 (0, 255, 0),
@@ -154,10 +279,30 @@ def main():
 
             cv2.putText(
                 frame,
-                f"Confidence: {confidence:.2f}",
-                (40, 125),
+                f"Static Confidence: {static_confidence:.2f}",
+                (40, 115),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
+                0.75,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"Motion: {motion_letter} {motion_confidence:.2f} | Move: {movement_score:.2f}",
+                (40, 150),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                "Press Q to quit",
+                (40, 178),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
                 (0, 255, 0),
                 2
             )
@@ -169,6 +314,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
