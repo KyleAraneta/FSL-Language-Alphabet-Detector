@@ -1,5 +1,6 @@
 import os
 import csv
+import time
 import urllib.request
 from collections import Counter
 
@@ -16,18 +17,47 @@ CAMERA_INDEX = 0
 SEQUENCE_LENGTH = 30
 MAX_HANDS = 2
 
+COUNTDOWN_SECONDS = 3.0
+PAGE_SIZE = 10
+
+# Pause between repeated captures.
+# Example: save sample -> wait 0.8s -> countdown again -> record again.
+REPEAT_PAUSE_SECONDS = 0.8
+
 PHRASE_LABELS = [
     "SALAMAT",
     "KAMUSTA",
     "MAGANDANG_UMAGA",
     "MAHAL_KITA",
-    "SORRY_/PASENSYA",
+    "PASENSYA",
     "OO",
     "HINDI",
     "ANG_PANGALAN_KO_AY_SI",
     "KAMUSTA_KA",
-    "AYOS_LANG_/ITS_OKAY",
+    "AYOS_LANG",
     "NAIINTINDIHAN_KO",
+    "MAGANDANG_HAPON",
+    "MAGANDANG_GABI",
+    "MALIGAYANG_PAGDATING",
+    "KAMI_AY_MGA",
+    "AKO",
+    "IKAW",
+    "ANO",
+    "KAILAN",
+    "SINO",
+    "BAKIT",
+    "SIGE",
+    "TEKA",
+    "HINDI_KO_ALAM",
+
+    # Add more phrases here later.
+    # Example:
+    # "PAARALAN",
+    # "BAHAY",
+    # "PAMILYA",
+    # "KAIBIGAN",
+    # "TULONG",
+
     "NONE"
 ]
 
@@ -69,6 +99,24 @@ def clean_label(label):
     return label
 
 
+def prepare_labels():
+    labels = [clean_label(label) for label in PHRASE_LABELS]
+    labels = [label for label in labels if label]
+
+    if "NONE" not in labels:
+        labels.append("NONE")
+
+    seen = set()
+    unique_labels = []
+
+    for label in labels:
+        if label not in seen:
+            unique_labels.append(label)
+            seen.add(label)
+
+    return unique_labels
+
+
 def create_csv_if_needed():
     os.makedirs(os.path.dirname(PHRASE_DATA_FILE), exist_ok=True)
 
@@ -95,6 +143,7 @@ def load_existing_counts():
 
             for row in reader:
                 label = clean_label(row.get("label", ""))
+
                 if label:
                     counts[label] += 1
     except Exception:
@@ -117,6 +166,7 @@ def get_two_hand_frame(all_hand_landmarks):
     for hand_landmarks in all_hand_landmarks:
         hands.append(landmarks_to_points(hand_landmarks))
 
+    # Stable left-to-right order.
     hands.sort(key=get_hand_center_x)
 
     while len(hands) < MAX_HANDS:
@@ -175,12 +225,117 @@ def draw_hand(frame, hand_landmarks, width, height):
             cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
 
 
-def draw_ui(frame, key_to_label, saved_counts, recording_label, sequence_length, detected_hands):
-    cv2.rectangle(frame, (20, 20), (1050, 285), (0, 0, 0), -1)
+def draw_ui(
+    frame,
+    labels,
+    saved_counts,
+    current_index,
+    detected_hands,
+    armed_label,
+    countdown_remaining,
+    recording_label,
+    sequence_length,
+    last_index,
+    jump_text,
+    auto_advance,
+    repeat_last_mode
+):
+    total_labels = len(labels)
+    current_label = labels[current_index]
+
+    # ============================================================
+    # COMPACT COUNTDOWN UI
+    # Hide the long instruction/phrase list while preparing.
+    # ============================================================
+    if armed_label is not None:
+        cv2.rectangle(frame, (20, 20), (960, 180), (0, 0, 0), -1)
+
+        cv2.putText(
+            frame,
+            f"GET READY: {armed_label}",
+            (40, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 255),
+            3
+        )
+
+        cv2.putText(
+            frame,
+            f"Recording starts in: {countdown_remaining:.1f}s",
+            (40, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (0, 255, 255),
+            3
+        )
+
+        cv2.putText(
+            frame,
+            f"Auto-repeat: {'ON' if repeat_last_mode else 'OFF'} | Press R to stop auto-repeat",
+            (40, 160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2
+        )
+
+        return
+
+    # ============================================================
+    # COMPACT RECORDING UI
+    # Hide instructions and phrase list while recording.
+    # ============================================================
+    if recording_label is not None:
+        cv2.rectangle(frame, (20, 20), (960, 180), (0, 0, 0), -1)
+
+        cv2.putText(
+            frame,
+            f"RECORDING: {recording_label}",
+            (40, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            3
+        )
+
+        cv2.putText(
+            frame,
+            f"Frames: {sequence_length}/{SEQUENCE_LENGTH}",
+            (40, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (0, 0, 255),
+            3
+        )
+
+        cv2.putText(
+            frame,
+            f"Auto-repeat: {'ON' if repeat_last_mode else 'OFF'} | Press R to stop after this capture",
+            (40, 160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2
+        )
+
+        return
+
+    # ============================================================
+    # NORMAL FULL UI
+    # This returns after countdown/recording is done.
+    # ============================================================
+    cv2.rectangle(frame, (20, 20), (1210, 390), (0, 0, 0), -1)
+
+    current_page = current_index // PAGE_SIZE
+    total_pages = (total_labels + PAGE_SIZE - 1) // PAGE_SIZE
+
+    start = current_page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total_labels)
 
     cv2.putText(
         frame,
-        "FSL Words / Phrases Data Collection - 2 Hands Supported",
+        "FSL Words / Phrases Data Collection - Index Mode",
         (35, 55),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -190,102 +345,102 @@ def draw_ui(frame, key_to_label, saved_counts, recording_label, sequence_length,
 
     cv2.putText(
         frame,
-        "Press assigned key to record 30 frames | ESC to quit",
+        "SPACE = record once | R = auto-repeat ON/OFF | N/B = next/back | ]/[ = page | A = auto advance | ESC = quit",
         (35, 90),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        0.45,
         (0, 255, 255),
         2
     )
 
     cv2.putText(
         frame,
-        f"Detected hands: {detected_hands}",
+        "Type phrase number then ENTER to jump. Example: 57 ENTER",
         (35, 120),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        0.55,
         (0, 255, 255),
         2
     )
 
-    y = 155
-    x = 35
+    cv2.putText(
+        frame,
+        f"Selected: {current_index + 1}/{total_labels} - {current_label} | Count: {saved_counts[current_label]}",
+        (35, 155),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 0),
+        2
+    )
 
-    for key, label in key_to_label.items():
-        text = f"{key.upper()} = {label} ({saved_counts[label]})"
+    cv2.putText(
+        frame,
+        f"Detected hands: {detected_hands} | Page: {current_page + 1}/{total_pages} | Jump: {jump_text} | Auto advance: {'ON' if auto_advance else 'OFF'} | Auto-repeat: {'ON' if repeat_last_mode else 'OFF'}",
+        (35, 185),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (0, 255, 255),
+        2
+    )
+
+    y = 225
+
+    for i in range(start, end):
+        label = labels[i]
+        marker = ">>" if i == current_index else "  "
+        text = f"{marker} {i + 1:03d}. {label} ({saved_counts[label]})"
+
+        color = (0, 255, 255) if i == current_index else (0, 255, 0)
 
         cv2.putText(
             frame,
             text,
-            (x, y),
+            (45, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (0, 255, 0),
+            0.55,
+            color,
             2
         )
 
-        y += 25
+        y += 28
 
-        if y > 260:
-            y = 155
-            x += 340
-
-    if recording_label is not None:
-        cv2.rectangle(frame, (20, 305), (820, 375), (0, 0, 0), -1)
+    if last_index is not None:
+        last_label = labels[last_index]
 
         cv2.putText(
             frame,
-            f"RECORDING: {recording_label}  {sequence_length}/{SEQUENCE_LENGTH}",
-            (35, 350),
+            f"Last recorded/repeated: {last_index + 1:03d}. {last_label}",
+            (620, 225),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            (0, 0, 255),
-            3
+            0.55,
+            (0, 255, 255),
+            2
         )
 
 
 def main():
-    labels = [clean_label(label) for label in PHRASE_LABELS]
-    labels = [label for label in labels if label]
+    labels = prepare_labels()
 
     if len(labels) < 2:
         print("Add at least 2 phrase labels in PHRASE_LABELS.")
         return
 
-    if "NONE" not in labels:
-        labels.append("NONE")
-
-    if len(set(labels)) != len(labels):
-        print("Duplicate labels found in PHRASE_LABELS. Please remove duplicates.")
-        return
-
-    keys = list("123456789abcdefghijklmnopqrstuvwxyz")
-
-    if len(labels) > len(keys):
-        print("Too many labels. Limit your first batch to 35 labels or fewer.")
-        return
-
-    key_to_label = {}
-
-    for i, label in enumerate(labels):
-        key_to_label[keys[i]] = label
-
     create_csv_if_needed()
     saved_counts = load_existing_counts()
 
     print("")
-    print("Phrase key map:")
-
-    for key, label in key_to_label.items():
-        print(f"{key.upper()} = {label}")
-
+    print("Index-based phrase collector is active.")
     print("")
-    print("Important:")
-    print("- This collector supports 1-hand and 2-hand phrases.")
-    print("- For 2-hand phrases, make sure both hands are visible before pressing the key.")
-    print("- For 1-hand phrases, show only the required signing hand.")
-    print("- For NONE, record neutral/random hand movement that is NOT one of your phrases.")
-    print("- Recommended: 50 to 100 samples per phrase, including NONE.")
+    print("Controls:")
+    print("SPACE = record selected phrase once")
+    print("R = auto-repeat last/selected phrase ON/OFF")
+    print("N = next phrase")
+    print("B = previous phrase")
+    print("] = next page")
+    print("[ = previous page")
+    print("A = toggle auto advance")
+    print("Type number + ENTER = jump to phrase number")
+    print("ESC = quit")
     print("")
 
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
@@ -297,8 +452,20 @@ def main():
         return
 
     frame_count = 0
+
+    current_index = 0
+    last_index = None
+
+    armed_label = None
+    armed_start_time = 0
+
     recording_label = None
+    recording_index = None
     sequence = []
+
+    jump_text = ""
+    auto_advance = False
+    repeat_last_mode = False
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -334,6 +501,21 @@ def main():
                 for hand_landmarks in result.hand_landmarks:
                     draw_hand(frame, hand_landmarks, w, h)
 
+            countdown_remaining = 0
+
+            # Countdown phase
+            if armed_label is not None and recording_label is None:
+                elapsed = time.time() - armed_start_time
+                countdown_remaining = max(COUNTDOWN_SECONDS - elapsed, 0)
+
+                if elapsed >= COUNTDOWN_SECONDS:
+                    recording_label = armed_label
+                    recording_index = current_index
+                    armed_label = None
+                    sequence = []
+                    print(f"Recording phrase: {recording_label}")
+
+            # Recording phase
             if recording_label is not None:
                 if current_two_hand_frame is not None:
                     sequence.append(current_two_hand_frame)
@@ -346,31 +528,154 @@ def main():
                         writer.writerow([recording_label] + features)
 
                     saved_counts[recording_label] += 1
+                    last_index = recording_index
 
-                    print(f"Saved phrase sample: {recording_label} | Total: {saved_counts[recording_label]}")
+                    saved_label = recording_label
+                    saved_index = recording_index
+
+                    print(
+                        f"Saved phrase sample: {saved_label} | "
+                        f"Total: {saved_counts[saved_label]}"
+                    )
 
                     recording_label = None
+                    recording_index = None
                     sequence = []
 
-            draw_ui(frame, key_to_label, saved_counts, recording_label, len(sequence), detected_hands)
+                    if repeat_last_mode:
+                        current_index = saved_index
+                        armed_label = saved_label
+
+                        # Small pause before the next countdown starts.
+                        # This gives you time to reset your hands.
+                        armed_start_time = time.time() + REPEAT_PAUSE_SECONDS
+
+                        print(f"Auto-repeat ON. Next capture for: {armed_label}")
+
+                    elif auto_advance:
+                        current_index = min(current_index + 1, len(labels) - 1)
+
+            draw_ui(
+                frame=frame,
+                labels=labels,
+                saved_counts=saved_counts,
+                current_index=current_index,
+                detected_hands=detected_hands,
+                armed_label=armed_label,
+                countdown_remaining=countdown_remaining,
+                recording_label=recording_label,
+                sequence_length=len(sequence),
+                last_index=last_index,
+                jump_text=jump_text,
+                auto_advance=auto_advance,
+                repeat_last_mode=repeat_last_mode
+            )
 
             cv2.imshow("Collect FSL Phrase Data", frame)
 
             key = cv2.waitKey(1) & 0xFF
 
+            if key == 255:
+                continue
+
             if key == 27:
                 break
 
-            if recording_label is None:
-                pressed_key = chr(key).lower() if key != 255 else ""
+            pressed_key = ""
 
-                if pressed_key in key_to_label:
-                    if current_two_hand_frame is None:
-                        print("Show your hand first before recording.")
+            if key not in [10, 13, 8]:
+                try:
+                    pressed_key = chr(key).lower()
+                except ValueError:
+                    pressed_key = ""
+
+            # Allow R to stop auto-repeat even during countdown/recording.
+            # If recording is already in progress, it finishes the current sample
+            # but will not automatically start another one.
+            if pressed_key == "r" and repeat_last_mode:
+                repeat_last_mode = False
+                auto_advance = False
+
+                if armed_label is not None and recording_label is None:
+                    armed_label = None
+
+                print("Auto-repeat OFF.")
+                continue
+
+            # Do not accept navigation while counting down or recording.
+            if armed_label is not None or recording_label is not None:
+                continue
+
+            # ENTER confirms numeric jump.
+            if key in [10, 13]:
+                if jump_text:
+                    target = int(jump_text)
+
+                    if 1 <= target <= len(labels):
+                        current_index = target - 1
+                        print(f"Selected phrase {target}: {labels[current_index]}")
                     else:
-                        recording_label = key_to_label[pressed_key]
-                        sequence = []
-                        print(f"Recording phrase: {recording_label}")
+                        print(f"Invalid phrase number: {target}")
+
+                    jump_text = ""
+
+                continue
+
+            # BACKSPACE clears typed jump number.
+            if key == 8:
+                jump_text = jump_text[:-1]
+                continue
+
+            if pressed_key.isdigit():
+                jump_text += pressed_key
+
+                if len(jump_text) > 3:
+                    jump_text = jump_text[-3:]
+
+            elif pressed_key == " ":
+                repeat_last_mode = False
+                armed_label = labels[current_index]
+                armed_start_time = time.time()
+                print(f"Get ready for: {armed_label}")
+
+            elif pressed_key == "n":
+                current_index = min(current_index + 1, len(labels) - 1)
+                jump_text = ""
+
+            elif pressed_key == "b":
+                current_index = max(current_index - 1, 0)
+                jump_text = ""
+
+            elif pressed_key == "]":
+                current_index = min(current_index + PAGE_SIZE, len(labels) - 1)
+                jump_text = ""
+
+            elif pressed_key == "[":
+                current_index = max(current_index - PAGE_SIZE, 0)
+                jump_text = ""
+
+            elif pressed_key == "r":
+                # Start auto-repeat.
+                # If there is a last recorded phrase, repeat that.
+                # Otherwise, repeat the currently selected phrase.
+                if last_index is not None:
+                    current_index = last_index
+
+                repeat_last_mode = True
+                auto_advance = False
+
+                armed_label = labels[current_index]
+                armed_start_time = time.time()
+
+                print(f"Auto-repeat ON for: {armed_label}")
+
+            elif pressed_key == "a":
+                auto_advance = not auto_advance
+
+                if auto_advance:
+                    repeat_last_mode = False
+
+                print(f"Auto advance: {'ON' if auto_advance else 'OFF'}")
 
     cap.release()
     cv2.destroyAllWindows()
