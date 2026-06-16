@@ -40,11 +40,9 @@ NUMBER_CONFIDENCE_THRESHOLD = 0.60
 PHRASE_CONFIDENCE_THRESHOLD = 0.70
 PHRASE_MOVEMENT_THRESHOLD = 0.00
 
-# Phrase reset/display behavior
 PHRASE_DETECTION_COOLDOWN_SECONDS = 0.35
 PHRASE_DISPLAY_HOLD_SECONDS = 2.50
 
-# Phrase status messages
 PHRASE_READY_MESSAGE = "READY: Perform next phrase now"
 PHRASE_WAIT_MESSAGE = "WAIT: Resetting detector..."
 PHRASE_CAPTURE_MESSAGE = "CAPTURING: Keep signing..."
@@ -60,12 +58,57 @@ MODE_PHRASES = "PHRASES"
 
 PHRASE_EXPECTED_FEATURES = SEQUENCE_LENGTH * PHRASE_MAX_HANDS * 21 * 3
 
-# Optional display-only rename map.
-# This changes the displayed text only. It does not change the trained model.
 PHRASE_DISPLAY_RENAME_MAP = {
     "AYOS_LANG_ITS_OKAY": "AYOS_LANG",
     "SORRY_PASENSYA": "PASENSYA",
 }
+
+# ============================================================
+# OUTPUT SENTENCE BUILDER SETTINGS
+# ============================================================
+AUTO_ADD_PHRASES_TO_OUTPUT = True
+AUTO_ADD_ALPHABET_TO_OUTPUT = True
+AUTO_ADD_NUMBERS_TO_OUTPUT = True
+
+PHRASE_ADD_COOLDOWN_SECONDS = 1.20
+
+MIN_LETTER_STABLE_COUNT = 6
+MIN_NUMBER_STABLE_COUNT = 6
+
+# ============================================================
+# DASHBOARD UI SETTINGS
+# ============================================================
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+
+HEADER_H = 70
+
+CAM_X = 20
+CAM_Y = 90
+CAM_W = 860
+CAM_H = 484
+
+SIDE_X = 900
+SIDE_Y = 90
+SIDE_W = 360
+SIDE_H = 484
+
+OUTPUT_X = 20
+OUTPUT_Y = 595
+OUTPUT_W = 1240
+OUTPUT_H = 105
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+COLOR_BG = (20, 20, 24)
+COLOR_PANEL = (8, 10, 14)
+COLOR_PANEL_2 = (28, 30, 36)
+COLOR_BORDER = (70, 70, 80)
+COLOR_GREEN = (0, 255, 80)
+COLOR_YELLOW = (0, 255, 255)
+COLOR_RED = (0, 80, 255)
+COLOR_WHITE = (245, 245, 245)
+COLOR_MUTED = (160, 160, 160)
 
 # ============================================================
 # DOWNLOAD MEDIAPIPE MODEL IF NEEDED
@@ -386,6 +429,48 @@ def predict_phrase_motion(classifier, sequence):
     return label, confidence
 
 # ============================================================
+# OUTPUT SENTENCE BUILDER HELPERS
+# ============================================================
+def append_token(output_tokens, output_types, token, token_type="word"):
+    token = str(token).upper().strip()
+
+    if not token:
+        return
+
+    token = token.replace("_", " ")
+
+    if token_type == "letter":
+        if len(token) != 1 or not token.isalpha():
+            return
+
+        if output_tokens and output_types[-1] == "letter":
+            output_tokens[-1] += token
+        else:
+            output_tokens.append(token)
+            output_types.append("letter")
+
+        return
+
+    if token_type == "number":
+        if len(token) != 1 or not token.isdigit():
+            return
+
+        if output_tokens and output_types[-1] == "number":
+            output_tokens[-1] += token
+        else:
+            output_tokens.append(token)
+            output_types.append("number")
+
+        return
+
+    output_tokens.append(token)
+    output_types.append("word")
+
+
+def get_output_text(output_tokens):
+    return " ".join(output_tokens).strip()
+
+# ============================================================
 # MENU HELPERS
 # ============================================================
 def is_finger_up(hand_landmarks, tip_id, pip_id):
@@ -442,40 +527,267 @@ def draw_hand(frame, hand_landmarks, width, height):
             cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
 
 
-def draw_menu(frame, selected_option, progress):
-    cv2.rectangle(frame, (20, 20), (780, 310), (0, 0, 0), -1)
+def make_base_canvas():
+    canvas = np.full((WINDOW_HEIGHT, WINDOW_WIDTH, 3), COLOR_BG, dtype=np.uint8)
 
-    cv2.putText(frame, "FILIPINO SIGN LANGUAGE DETECTOR", (40, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    cv2.rectangle(canvas, (0, 0), (WINDOW_WIDTH, HEADER_H), COLOR_PANEL, -1)
+    cv2.line(canvas, (0, HEADER_H), (WINDOW_WIDTH, HEADER_H), COLOR_RED, 3)
 
-    cv2.putText(frame, "Show hand sign 1, 2, or 3 to choose a mode", (40, 105),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+    cv2.putText(
+        canvas,
+        "FILIPINO SIGN LANGUAGE DETECTOR",
+        (25, 43),
+        FONT,
+        0.8,
+        COLOR_GREEN,
+        2
+    )
 
-    cv2.putText(frame, "Option 1 - FSL Alphabet", (60, 160),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+    cv2.putText(
+        canvas,
+        "M = menu   |   C = clear sentence   |   Backspace = undo   |   Q = quit",
+        (620, 43),
+        FONT,
+        0.48,
+        COLOR_YELLOW,
+        1
+    )
 
-    cv2.putText(frame, "Option 2 - FSL Numbers 0-9", (60, 205),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+    return canvas
 
-    cv2.putText(frame, "Option 3 - FSL Words / Phrases", (60, 250),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+
+def paste_camera(canvas, camera_frame):
+    camera_view = cv2.resize(camera_frame, (CAM_W, CAM_H))
+
+    cv2.rectangle(
+        canvas,
+        (CAM_X - 2, CAM_Y - 2),
+        (CAM_X + CAM_W + 2, CAM_Y + CAM_H + 2),
+        COLOR_BORDER,
+        2
+    )
+
+    canvas[CAM_Y:CAM_Y + CAM_H, CAM_X:CAM_X + CAM_W] = camera_view
+
+    cv2.rectangle(
+        canvas,
+        (CAM_X + 12, CAM_Y + CAM_H - 38),
+        (CAM_X + 112, CAM_Y + CAM_H - 12),
+        COLOR_PANEL,
+        -1
+    )
+
+    cv2.putText(
+        canvas,
+        "LIVE",
+        (CAM_X + 30, CAM_Y + CAM_H - 20),
+        FONT,
+        0.48,
+        COLOR_GREEN,
+        1
+    )
+
+
+def draw_panel(canvas, x, y, w, h, title):
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), COLOR_PANEL, -1)
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), COLOR_BORDER, 2)
+
+    cv2.rectangle(canvas, (x, y), (x + w, y + 42), COLOR_PANEL_2, -1)
+
+    cv2.putText(
+        canvas,
+        title,
+        (x + 16, y + 28),
+        FONT,
+        0.55,
+        COLOR_WHITE,
+        2
+    )
+
+
+def draw_wrapped_text(canvas, text, x, y, max_chars, font_scale, color, thickness, line_gap):
+    text = str(text)
+
+    if not text:
+        return y
+
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = word if current == "" else current + " " + word
+
+        if len(test) <= max_chars:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    for line in lines:
+        cv2.putText(canvas, line, (x, y), FONT, font_scale, color, thickness)
+        y += line_gap
+
+    return y
+
+
+def draw_output_panel(canvas, output_text):
+    draw_panel(canvas, OUTPUT_X, OUTPUT_Y, OUTPUT_W, OUTPUT_H, "OUTPUT SENTENCE")
+
+    if output_text:
+        display_text = output_text[-90:]
+        color = COLOR_GREEN
+    else:
+        display_text = "Start signing to build a sentence..."
+        color = COLOR_MUTED
+
+    draw_wrapped_text(
+        canvas,
+        display_text,
+        OUTPUT_X + 18,
+        OUTPUT_Y + 72,
+        65,
+        0.75,
+        color,
+        2,
+        32
+    )
+
+
+def draw_menu_dashboard(camera_frame, selected_option, progress, output_text):
+    canvas = make_base_canvas()
+    paste_camera(canvas, camera_frame)
+
+    draw_panel(canvas, SIDE_X, SIDE_Y, SIDE_W, SIDE_H, "MODE SELECTION")
+
+    cv2.putText(canvas, "Show 1, 2, or 3", (SIDE_X + 22, SIDE_Y + 85), FONT, 0.72, COLOR_YELLOW, 2)
+    cv2.putText(canvas, "to choose a mode.", (SIDE_X + 22, SIDE_Y + 120), FONT, 0.62, COLOR_YELLOW, 2)
+
+    options_text = [
+        ("1", "FSL Alphabet"),
+        ("2", "FSL Numbers 0-9"),
+        ("3", "FSL Words / Phrases"),
+    ]
+
+    y = SIDE_Y + 185
+
+    for number, label in options_text:
+        color = COLOR_GREEN
+
+        if selected_option == number:
+            color = COLOR_YELLOW
+
+        cv2.putText(canvas, f"Option {number}", (SIDE_X + 28, y), FONT, 0.60, color, 2)
+        cv2.putText(canvas, label, (SIDE_X + 28, y + 32), FONT, 0.56, color, 2)
+
+        y += 82
 
     if selected_option:
-        cv2.putText(frame, f"Selecting Option {selected_option}... {progress:.0f}%",
-                    (40, 295), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        bar_x = SIDE_X + 25
+        bar_y = SIDE_Y + SIDE_H - 62
+        bar_w = SIDE_W - 50
+        bar_h = 22
+
+        cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), COLOR_PANEL_2, -1)
+        cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + int(bar_w * progress / 100), bar_y + bar_h), COLOR_GREEN, -1)
+
+        cv2.putText(
+            canvas,
+            f"Selecting Option {selected_option}... {progress:.0f}%",
+            (bar_x, bar_y - 14),
+            FONT,
+            0.48,
+            COLOR_YELLOW,
+            1
+        )
+
+    draw_output_panel(canvas, output_text)
+    return canvas
+
+
+def draw_detection_dashboard(
+    camera_frame,
+    mode_name,
+    detected_label,
+    raw_label,
+    confidence,
+    movement_score,
+    detected_hands,
+    status_text,
+    status_color,
+    output_text
+):
+    canvas = make_base_canvas()
+    paste_camera(canvas, camera_frame)
+
+    draw_panel(canvas, SIDE_X, SIDE_Y, SIDE_W, SIDE_H, mode_name)
+
+    cv2.putText(
+        canvas,
+        "DETECTED",
+        (SIDE_X + 22, SIDE_Y + 82),
+        FONT,
+        0.55,
+        COLOR_MUTED,
+        2
+    )
+
+    if detected_label:
+        draw_wrapped_text(
+            canvas,
+            detected_label,
+            SIDE_X + 22,
+            SIDE_Y + 132,
+            16,
+            0.85,
+            COLOR_GREEN,
+            3,
+            40
+        )
     else:
-        cv2.putText(frame, "Press Q to quit", (40, 295),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(
+            canvas,
+            "---",
+            (SIDE_X + 22, SIDE_Y + 132),
+            FONT,
+            1.0,
+            COLOR_MUTED,
+            2
+        )
 
+    metric_y = SIDE_Y + 245
 
-def draw_mode_header(frame, mode_name):
-    cv2.rectangle(frame, (20, 20), (940, 90), (0, 0, 0), -1)
+    cv2.putText(canvas, f"Raw: {raw_label}", (SIDE_X + 22, metric_y), FONT, 0.48, COLOR_WHITE, 1)
+    cv2.putText(canvas, f"Confidence: {confidence:.2f}", (SIDE_X + 22, metric_y + 34), FONT, 0.48, COLOR_WHITE, 1)
+    cv2.putText(canvas, f"Movement: {movement_score:.2f}", (SIDE_X + 22, metric_y + 68), FONT, 0.48, COLOR_WHITE, 1)
+    cv2.putText(canvas, f"Hands: {detected_hands}", (SIDE_X + 22, metric_y + 102), FONT, 0.48, COLOR_WHITE, 1)
 
-    cv2.putText(frame, f"Mode: {mode_name}", (40, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+    cv2.rectangle(
+        canvas,
+        (SIDE_X + 18, SIDE_Y + SIDE_H - 112),
+        (SIDE_X + SIDE_W - 18, SIDE_Y + SIDE_H - 20),
+        COLOR_PANEL_2,
+        -1
+    )
 
-    cv2.putText(frame, "Press M for menu | Press Q to quit", (560, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+    draw_wrapped_text(
+        canvas,
+        status_text,
+        SIDE_X + 32,
+        SIDE_Y + SIDE_H - 72,
+        26,
+        0.50,
+        status_color,
+        2,
+        26
+    )
+
+    draw_output_panel(canvas, output_text)
+    return canvas
 
 # ============================================================
 # MAIN APP
@@ -502,18 +814,27 @@ def main():
     displayed_phrase_time = 0
     phrase_cooldown_until = 0
 
+    output_tokens = []
+    output_types = []
+
+    last_added_phrase = ""
+    last_added_phrase_time = 0
+
+    last_added_letter = ""
+    last_added_number = ""
+
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
-            ret, frame = cap.read()
+            ret, camera_frame = cap.read()
 
             if not ret:
                 print("Failed to read camera.")
                 break
 
-            frame = cv2.flip(frame, 1)
-            h, w, _ = frame.shape
+            camera_frame = cv2.flip(camera_frame, 1)
+            h, w, _ = camera_frame.shape
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
             rgb = np.ascontiguousarray(rgb)
 
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -533,13 +854,16 @@ def main():
                 hand_landmarks = all_hand_landmarks[0]
 
                 for one_hand_landmarks in all_hand_landmarks:
-                    draw_hand(frame, one_hand_landmarks, w, h)
+                    draw_hand(camera_frame, one_hand_landmarks, w, h)
 
                 if current_mode == MODE_ALPHABET:
                     motion_buffer.append(raw_landmarks(hand_landmarks))
 
                 elif current_mode == MODE_PHRASES:
                     motion_buffer.append(get_two_hand_frame(all_hand_landmarks))
+
+            output_text = get_output_text(output_tokens)
+            dashboard_frame = None
 
             # ====================================================
             # MENU MODE
@@ -563,9 +887,11 @@ def main():
                                 if detected_option == "1":
                                     current_mode = MODE_ALPHABET
                                     print("Alphabet mode selected.")
+
                                 elif detected_option == "2":
                                     current_mode = MODE_NUMBERS
                                     print("Numbers mode selected.")
+
                                 elif detected_option == "3":
                                     current_mode = MODE_PHRASES
                                     print("Phrases mode selected.")
@@ -576,6 +902,8 @@ def main():
                                 displayed_phrase_label = ""
                                 displayed_phrase_time = 0
                                 phrase_cooldown_until = 0
+                                last_added_letter = ""
+                                last_added_number = ""
                     else:
                         menu_candidate = ""
                         menu_candidate_start = 0
@@ -584,14 +912,12 @@ def main():
                     menu_candidate_start = 0
 
                 selected_option = menu_candidate
-                draw_menu(frame, selected_option, progress)
+                dashboard_frame = draw_menu_dashboard(camera_frame, selected_option, progress, output_text)
 
             # ====================================================
             # ALPHABET MODE
             # ====================================================
             elif current_mode == MODE_ALPHABET:
-                draw_mode_header(frame, "FSL Alphabet")
-
                 static_letter = ""
                 static_confidence = 0.0
                 motion_letter = ""
@@ -605,17 +931,35 @@ def main():
                     and now - last_motion_time <= MOTION_HOLD_SECONDS
                 )
 
+                status_text = "Show an alphabet hand sign."
+                status_color = COLOR_YELLOW
+
                 if hand_landmarks is not None:
                     static_letter, static_confidence = predict_static(
                         alphabet_classifier,
                         hand_landmarks
                     )
 
+                    static_letter = str(static_letter).upper().strip()
+
                     if static_confidence >= STATIC_CONFIDENCE_THRESHOLD:
                         alphabet_history.append(static_letter)
 
                     stable_letter = get_stable_prediction(alphabet_history)
                     final_letter = stable_letter
+
+                    if AUTO_ADD_ALPHABET_TO_OUTPUT:
+                        letter_count = alphabet_history.count(stable_letter)
+                        can_add_letter = (
+                            stable_letter
+                            and letter_count >= MIN_LETTER_STABLE_COUNT
+                            and stable_letter != last_added_letter
+                        )
+
+                        if can_add_letter:
+                            append_token(output_tokens, output_types, stable_letter, token_type="letter")
+                            last_added_letter = stable_letter
+                            print(f"Added letter to output: {stable_letter}")
 
                     if motion_hold_active:
                         final_letter = last_motion_letter
@@ -636,42 +980,54 @@ def main():
                                     last_motion_letter = motion_letter
                                     last_motion_time = time.time()
                                     final_letter = motion_letter
+
+                                    if AUTO_ADD_ALPHABET_TO_OUTPUT and motion_letter != last_added_letter:
+                                        append_token(output_tokens, output_types, motion_letter, token_type="letter")
+                                        last_added_letter = motion_letter
+                                        print(f"Added motion letter to output: {motion_letter}")
+
                                     alphabet_history.clear()
                                     motion_buffer.clear()
+
+                    if final_letter:
+                        status_text = "Letter captured. Remove hand before repeating same letter."
+                        status_color = COLOR_GREEN
                 else:
                     alphabet_history.clear()
                     motion_buffer.clear()
                     final_letter = ""
+                    last_added_letter = ""
+                    status_text = "READY: Show a letter."
+                    status_color = COLOR_GREEN
 
-                cv2.rectangle(frame, (20, 110), (700, 260), (0, 0, 0), -1)
+                output_text = get_output_text(output_tokens)
 
-                cv2.putText(frame, f"Detected Letter: {final_letter}", (40, 160),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-                cv2.putText(frame, f"Static Confidence: {static_confidence:.2f}", (40, 205),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-
-                cv2.putText(frame, f"Motion: {motion_letter} {motion_confidence:.2f} | Move: {movement_score:.2f}",
-                            (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+                dashboard_frame = draw_detection_dashboard(
+                    camera_frame=camera_frame,
+                    mode_name="MODE: FSL ALPHABET",
+                    detected_label=final_letter,
+                    raw_label=static_letter,
+                    confidence=static_confidence,
+                    movement_score=movement_score,
+                    detected_hands=detected_hands,
+                    status_text=status_text,
+                    status_color=status_color,
+                    output_text=output_text
+                )
 
             # ====================================================
             # NUMBERS MODE
             # ====================================================
             elif current_mode == MODE_NUMBERS:
-                draw_mode_header(frame, "FSL Numbers 0-9")
-
                 detected_number = ""
                 number_confidence = 0.0
 
+                status_text = "Show a number hand sign."
+                status_color = COLOR_YELLOW
+
                 if number_classifier is None:
-                    cv2.rectangle(frame, (20, 110), (900, 230), (0, 0, 0), -1)
-
-                    cv2.putText(frame, "Number model not found.", (40, 160),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-                    cv2.putText(frame, "Create and train models/numbers/fsl_number_model.joblib first.",
-                                (40, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 255), 2)
-
+                    status_text = "Number model not found."
+                    status_color = COLOR_RED
                 else:
                     if hand_landmarks is not None:
                         number_label, number_confidence = predict_static(
@@ -679,75 +1035,90 @@ def main():
                             hand_landmarks
                         )
 
+                        number_label = str(number_label).upper().strip()
+
                         if number_confidence >= NUMBER_CONFIDENCE_THRESHOLD:
                             number_history.append(number_label)
 
                         detected_number = get_stable_prediction(number_history)
+
+                        if AUTO_ADD_NUMBERS_TO_OUTPUT:
+                            number_count = number_history.count(detected_number)
+                            can_add_number = (
+                                detected_number
+                                and number_count >= MIN_NUMBER_STABLE_COUNT
+                                and detected_number != last_added_number
+                            )
+
+                            if can_add_number:
+                                append_token(output_tokens, output_types, detected_number, token_type="number")
+                                last_added_number = detected_number
+                                print(f"Added number to output: {detected_number}")
+
+                        if detected_number:
+                            status_text = "Number captured. Remove hand before repeating same number."
+                            status_color = COLOR_GREEN
                     else:
                         number_history.clear()
+                        last_added_number = ""
+                        status_text = "READY: Show a number."
+                        status_color = COLOR_GREEN
 
-                    cv2.rectangle(frame, (20, 110), (650, 220), (0, 0, 0), -1)
+                output_text = get_output_text(output_tokens)
 
-                    cv2.putText(frame, f"Detected Number: {detected_number}", (40, 165),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-                    cv2.putText(frame, f"Confidence: {number_confidence:.2f}", (40, 205),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+                dashboard_frame = draw_detection_dashboard(
+                    camera_frame=camera_frame,
+                    mode_name="MODE: FSL NUMBERS",
+                    detected_label=detected_number,
+                    raw_label=detected_number,
+                    confidence=number_confidence,
+                    movement_score=0.0,
+                    detected_hands=detected_hands,
+                    status_text=status_text,
+                    status_color=status_color,
+                    output_text=output_text
+                )
 
             # ====================================================
             # PHRASES MODE
             # ====================================================
             elif current_mode == MODE_PHRASES:
-                draw_mode_header(frame, "FSL Words / Phrases")
-
                 phrase_confidence = 0.0
                 movement_score = 0.0
                 raw_phrase_label = ""
+                display_phrase = ""
 
                 now = time.time()
                 phrase_status = PHRASE_READY_MESSAGE
-                phrase_status_color = (0, 255, 0)
+                phrase_status_color = COLOR_GREEN
 
                 if phrase_classifier is None:
-                    cv2.rectangle(frame, (20, 110), (900, 250), (0, 0, 0), -1)
-
-                    cv2.putText(frame, "Phrase model not found.", (40, 160),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-
-                    cv2.putText(frame, "Create and train models/phrases/fsl_phrase_model.joblib first.",
-                                (40, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                    phrase_status = "Phrase model not found."
+                    phrase_status_color = COLOR_RED
 
                 elif not phrase_model_compatible:
-                    cv2.rectangle(frame, (20, 110), (1060, 285), (0, 0, 0), -1)
-
-                    cv2.putText(frame, "Phrase model format is old/incompatible.", (40, 160),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.90, (0, 0, 255), 2)
-
-                    cv2.putText(frame, "Recollect phrase data using the 2-hand collect_phrase_data.py.",
-                                (40, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-
-                    cv2.putText(frame, "Then run train_phrase_model.py again.",
-                                (40, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                    phrase_status = "Phrase model is old/incompatible. Retrain phrase model."
+                    phrase_status_color = COLOR_RED
 
                 else:
                     if now < phrase_cooldown_until:
                         phrase_status = PHRASE_WAIT_MESSAGE
-                        phrase_status_color = (0, 255, 255)
+                        phrase_status_color = COLOR_YELLOW
                         motion_buffer.clear()
 
                     elif hand_landmarks is None:
-                        phrase_status = "READY: Show your hand to start"
-                        phrase_status_color = (0, 255, 0)
+                        phrase_status = "READY: Show your hand to start."
+                        phrase_status_color = COLOR_GREEN
                         motion_buffer.clear()
                         phrase_history.clear()
 
                     elif len(motion_buffer) < SEQUENCE_LENGTH:
                         phrase_status = f"{PHRASE_CAPTURE_MESSAGE} {len(motion_buffer)}/{SEQUENCE_LENGTH}"
-                        phrase_status_color = (0, 255, 255)
+                        phrase_status_color = COLOR_YELLOW
 
                     elif hand_landmarks is not None and len(motion_buffer) == SEQUENCE_LENGTH:
                         phrase_status = PHRASE_ANALYZE_MESSAGE
-                        phrase_status_color = (0, 255, 255)
+                        phrase_status_color = COLOR_YELLOW
 
                         sequence = list(motion_buffer)
                         movement_score = calculate_phrase_movement(sequence)
@@ -769,6 +1140,35 @@ def main():
                                     phrase_cooldown_until = now + PHRASE_DETECTION_COOLDOWN_SECONDS
                                     phrase_history.clear()
 
+                                    if AUTO_ADD_PHRASES_TO_OUTPUT:
+                                        can_add_phrase = (
+                                            raw_phrase_label
+                                            and raw_phrase_label != "NONE"
+                                            and (
+                                                raw_phrase_label != last_added_phrase
+                                                or now - last_added_phrase_time >= PHRASE_ADD_COOLDOWN_SECONDS
+                                            )
+                                        )
+
+                                        if can_add_phrase:
+                                            display_label_for_output = PHRASE_DISPLAY_RENAME_MAP.get(
+                                                raw_phrase_label,
+                                                raw_phrase_label
+                                            )
+
+                                            append_token(
+                                                output_tokens,
+                                                output_types,
+                                                display_label_for_output,
+                                                token_type="word"
+                                            )
+
+                                            last_added_phrase = raw_phrase_label
+                                            last_added_phrase_time = now
+                                            last_added_letter = ""
+                                            last_added_number = ""
+                                            print(f"Added phrase to output: {display_label_for_output}")
+
                         motion_buffer.clear()
 
                     if displayed_phrase_label and now - displayed_phrase_time <= PHRASE_DISPLAY_HOLD_SECONDS:
@@ -777,24 +1177,22 @@ def main():
                     else:
                         display_phrase = ""
 
-                    cv2.rectangle(frame, (20, 110), (1060, 350), (0, 0, 0), -1)
+                output_text = get_output_text(output_tokens)
 
-                    cv2.putText(frame, f"Detected Phrase: {display_phrase}", (40, 165),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+                dashboard_frame = draw_detection_dashboard(
+                    camera_frame=camera_frame,
+                    mode_name="MODE: FSL PHRASES",
+                    detected_label=display_phrase,
+                    raw_label=raw_phrase_label,
+                    confidence=phrase_confidence,
+                    movement_score=movement_score,
+                    detected_hands=detected_hands,
+                    status_text=phrase_status,
+                    status_color=phrase_status_color,
+                    output_text=output_text
+                )
 
-                    cv2.putText(frame, f"Raw: {raw_phrase_label} | Confidence: {phrase_confidence:.2f}",
-                                (40, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 0), 2)
-
-                    cv2.putText(frame, f"Movement Score: {movement_score:.2f} | Hands: {detected_hands}",
-                                (40, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 0), 2)
-
-                    cv2.putText(frame, phrase_status, (40, 295),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.85, phrase_status_color, 3)
-
-                    cv2.putText(frame, "Perform the next phrase only when READY appears.",
-                                (40, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-
-            cv2.imshow("FSL Detector Menu System", frame)
+            cv2.imshow("FSL Detector Menu System", dashboard_frame)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -811,7 +1209,26 @@ def main():
                 displayed_phrase_time = 0
                 phrase_cooldown_until = 0
 
+                last_added_letter = ""
+                last_added_number = ""
+
                 print("Returned to main menu.")
+
+            if key == ord("c"):
+                output_tokens.clear()
+                output_types.clear()
+
+                last_added_phrase = ""
+                last_added_letter = ""
+                last_added_number = ""
+
+                print("Output sentence cleared.")
+
+            if key == 8:
+                if output_tokens:
+                    removed = output_tokens.pop()
+                    output_types.pop()
+                    print(f"Removed from output: {removed}")
 
     cap.release()
     cv2.destroyAllWindows()

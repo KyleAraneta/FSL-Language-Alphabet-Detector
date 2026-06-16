@@ -8,6 +8,9 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+# ============================================================
+# PATHS / SETTINGS
+# ============================================================
 MODEL_PATH = "hand_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 
@@ -18,12 +21,11 @@ SEQUENCE_LENGTH = 30
 MAX_HANDS = 2
 
 COUNTDOWN_SECONDS = 3.0
-PAGE_SIZE = 10
-
-# Pause between repeated captures.
-# Example: save sample -> wait 0.8s -> countdown again -> record again.
 REPEAT_PAUSE_SECONDS = 0.8
+PAGE_SIZE = 8
 
+# Add all your FSL words/phrases here.
+# Index mode supports 100+ phrases.
 PHRASE_LABELS = [
     "SALAMAT",
     "KAMUSTA",
@@ -42,25 +44,55 @@ PHRASE_LABELS = [
     "KAMI_AY_MGA",
     "AKO",
     "IKAW",
-    "ANO",
     "KAILAN",
     "SINO",
     "BAKIT",
     "SIGE",
     "TEKA",
     "HINDI_KO_ALAM",
-
-    # Add more phrases here later.
-    # Example:
-    # "PAARALAN",
-    # "BAHAY",
-    # "PAMILYA",
-    # "KAIBIGAN",
-    # "TULONG",
-
-    "NONE"
+    "MASAYA_AKONG",
+    "MAKILALA_KA",
 ]
 
+# ============================================================
+# DASHBOARD UI SETTINGS
+# ============================================================
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+
+HEADER_H = 64
+
+CAM_X = 20
+CAM_Y = 84
+CAM_W = 760
+CAM_H = 456
+
+SIDE_X = 800
+SIDE_Y = 84
+SIDE_W = 460
+SIDE_H = 456
+
+BOTTOM_X = 20
+BOTTOM_Y = 560
+BOTTOM_W = 1240
+BOTTOM_H = 140
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+COLOR_BG = (20, 20, 24)
+COLOR_PANEL = (8, 10, 14)
+COLOR_PANEL_2 = (28, 30, 36)
+COLOR_BORDER = (75, 75, 85)
+COLOR_GREEN = (0, 255, 80)
+COLOR_YELLOW = (0, 255, 255)
+COLOR_RED = (0, 70, 255)
+COLOR_WHITE = (245, 245, 245)
+COLOR_MUTED = (155, 155, 155)
+COLOR_BLUE = (255, 140, 0)
+
+# ============================================================
+# MEDIAPIPE SETUP
+# ============================================================
 if not os.path.exists(MODEL_PATH):
     print("Downloading hand landmarker model...")
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
@@ -89,14 +121,20 @@ HAND_CONNECTIONS = [
     (0, 17)
 ]
 
-
+# ============================================================
+# DATA HELPERS
+# ============================================================
 def clean_label(label):
     label = str(label).strip().upper()
     label = label.replace("?", "")
     label = label.replace("/", "_")
     label = label.replace("-", "_")
     label = "_".join(label.split())
-    return label
+
+    while "__" in label:
+        label = label.replace("__", "_")
+
+    return label.strip("_")
 
 
 def prepare_labels():
@@ -152,6 +190,15 @@ def load_existing_counts():
     return counts
 
 
+def save_sample(label, features):
+    with open(PHRASE_DATA_FILE, "a", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([label] + features)
+
+
+# ============================================================
+# LANDMARK HELPERS
+# ============================================================
 def landmarks_to_points(hand_landmarks):
     return [(lm.x, lm.y, lm.z) for lm in hand_landmarks]
 
@@ -166,7 +213,7 @@ def get_two_hand_frame(all_hand_landmarks):
     for hand_landmarks in all_hand_landmarks:
         hands.append(landmarks_to_points(hand_landmarks))
 
-    # Stable left-to-right order.
+    # Stable left-to-right ordering.
     hands.sort(key=get_hand_center_x)
 
     while len(hands) < MAX_HANDS:
@@ -212,20 +259,374 @@ def sequence_to_features(sequence):
     return features
 
 
+# ============================================================
+# DRAWING HELPERS
+# ============================================================
 def draw_hand(frame, hand_landmarks, width, height):
     points = []
 
     for lm in hand_landmarks:
         x, y = int(lm.x * width), int(lm.y * height)
         points.append((x, y))
-        cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+        cv2.circle(frame, (x, y), 5, COLOR_GREEN, -1)
 
     for start, end in HAND_CONNECTIONS:
         if start < len(points) and end < len(points):
-            cv2.line(frame, points[start], points[end], (255, 0, 0), 2)
+            cv2.line(frame, points[start], points[end], COLOR_BLUE, 2)
 
 
-def draw_ui(
+def make_canvas():
+    canvas = np.full((WINDOW_HEIGHT, WINDOW_WIDTH, 3), COLOR_BG, dtype=np.uint8)
+
+    cv2.rectangle(canvas, (0, 0), (WINDOW_WIDTH, HEADER_H), COLOR_PANEL, -1)
+    cv2.line(canvas, (0, HEADER_H), (WINDOW_WIDTH, HEADER_H), COLOR_RED, 3)
+
+    cv2.putText(
+        canvas,
+        "FSL PHRASE DATA COLLECTOR",
+        (24, 40),
+        FONT,
+        0.82,
+        COLOR_GREEN,
+        2
+    )
+
+    cv2.putText(
+        canvas,
+        "SPACE = record once   |   R = auto-repeat   |   N/B = next/back   |   ]/[ = page   |   A = auto advance   |   ESC = quit",
+        (450, 38),
+        FONT,
+        0.42,
+        COLOR_YELLOW,
+        1
+    )
+
+    return canvas
+
+
+def paste_camera(canvas, frame):
+    camera_view = cv2.resize(frame, (CAM_W, CAM_H))
+
+    cv2.rectangle(
+        canvas,
+        (CAM_X - 2, CAM_Y - 2),
+        (CAM_X + CAM_W + 2, CAM_Y + CAM_H + 2),
+        COLOR_BORDER,
+        2
+    )
+
+    canvas[CAM_Y:CAM_Y + CAM_H, CAM_X:CAM_X + CAM_W] = camera_view
+
+    cv2.rectangle(
+        canvas,
+        (CAM_X + 14, CAM_Y + CAM_H - 38),
+        (CAM_X + 116, CAM_Y + CAM_H - 12),
+        COLOR_PANEL,
+        -1
+    )
+
+    cv2.putText(
+        canvas,
+        "LIVE",
+        (CAM_X + 35, CAM_Y + CAM_H - 20),
+        FONT,
+        0.48,
+        COLOR_GREEN,
+        1
+    )
+
+
+def draw_panel(canvas, x, y, w, h, title):
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), COLOR_PANEL, -1)
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), COLOR_BORDER, 2)
+
+    cv2.rectangle(canvas, (x, y), (x + w, y + 42), COLOR_PANEL_2, -1)
+
+    cv2.putText(
+        canvas,
+        title,
+        (x + 15, y + 28),
+        FONT,
+        0.55,
+        COLOR_WHITE,
+        2
+    )
+
+
+def draw_wrapped_text(canvas, text, x, y, max_chars, font_scale, color, thickness, line_gap):
+    text = str(text)
+
+    if not text:
+        return y
+
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = word if current == "" else current + " " + word
+
+        if len(test) <= max_chars:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    for line in lines:
+        cv2.putText(canvas, line, (x, y), FONT, font_scale, color, thickness)
+        y += line_gap
+
+    return y
+
+
+def draw_progress_bar(canvas, x, y, w, h, progress, color):
+    progress = max(0.0, min(progress, 1.0))
+
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), COLOR_PANEL_2, -1)
+    cv2.rectangle(canvas, (x, y), (x + int(w * progress), y + h), color, -1)
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), COLOR_BORDER, 1)
+
+
+def draw_phrase_list(
+    canvas,
+    labels,
+    saved_counts,
+    current_index,
+    jump_text,
+    auto_advance,
+    repeat_mode,
+    last_index
+):
+    draw_panel(canvas, SIDE_X, SIDE_Y, SIDE_W, SIDE_H, "PHRASE INDEX")
+
+    total_labels = len(labels)
+    current_label = labels[current_index]
+
+    current_page = current_index // PAGE_SIZE
+    total_pages = (total_labels + PAGE_SIZE - 1) // PAGE_SIZE
+
+    start = current_page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total_labels)
+
+    cv2.putText(
+        canvas,
+        f"Selected: {current_index + 1}/{total_labels}",
+        (SIDE_X + 18, SIDE_Y + 72),
+        FONT,
+        0.52,
+        COLOR_YELLOW,
+        1
+    )
+
+    draw_wrapped_text(
+        canvas,
+        current_label.replace("_", " "),
+        SIDE_X + 18,
+        SIDE_Y + 105,
+        24,
+        0.62,
+        COLOR_GREEN,
+        2,
+        28
+    )
+
+    cv2.putText(
+        canvas,
+        f"Count: {saved_counts[current_label]}",
+        (SIDE_X + 18, SIDE_Y + 162),
+        FONT,
+        0.50,
+        COLOR_WHITE,
+        1
+    )
+
+    cv2.putText(
+        canvas,
+        f"Page: {current_page + 1}/{total_pages}  Jump: {jump_text}",
+        (SIDE_X + 18, SIDE_Y + 190),
+        FONT,
+        0.45,
+        COLOR_MUTED,
+        1
+    )
+
+    cv2.putText(
+        canvas,
+        f"Auto advance: {'ON' if auto_advance else 'OFF'}",
+        (SIDE_X + 18, SIDE_Y + 218),
+        FONT,
+        0.45,
+        COLOR_GREEN if auto_advance else COLOR_MUTED,
+        1
+    )
+
+    cv2.putText(
+        canvas,
+        f"Auto-repeat: {'ON' if repeat_mode else 'OFF'}",
+        (SIDE_X + 230, SIDE_Y + 218),
+        FONT,
+        0.45,
+        COLOR_GREEN if repeat_mode else COLOR_MUTED,
+        1
+    )
+
+    y = SIDE_Y + 260
+
+    for i in range(start, end):
+        label = labels[i]
+        marker = ">" if i == current_index else " "
+        color = COLOR_YELLOW if i == current_index else COLOR_GREEN
+
+        text = f"{marker} {i + 1:03d}. {label[:26]} ({saved_counts[label]})"
+
+        cv2.putText(
+            canvas,
+            text,
+            (SIDE_X + 18, y),
+            FONT,
+            0.45,
+            color,
+            1
+        )
+
+        y += 24
+
+    if last_index is not None:
+        last_label = labels[last_index]
+        cv2.putText(
+            canvas,
+            f"Last: {last_index + 1:03d}. {last_label[:22]}",
+            (SIDE_X + 18, SIDE_Y + SIDE_H - 24),
+            FONT,
+            0.43,
+            COLOR_YELLOW,
+            1
+        )
+
+
+def draw_bottom_panel(
+    canvas,
+    detected_hands,
+    current_label,
+    saved_counts,
+    armed_label,
+    countdown_remaining,
+    recording_label,
+    sequence_length,
+    repeat_mode,
+    repeat_delay_remaining,
+    message
+):
+    draw_panel(canvas, BOTTOM_X, BOTTOM_Y, BOTTOM_W, BOTTOM_H, "COLLECTION STATUS")
+
+    left_x = BOTTOM_X + 18
+    mid_x = BOTTOM_X + 470
+    right_x = BOTTOM_X + 900
+    top_y = BOTTOM_Y + 62
+
+    cv2.putText(
+        canvas,
+        f"Detected hands: {detected_hands}",
+        (left_x, top_y),
+        FONT,
+        0.55,
+        COLOR_WHITE,
+        1
+    )
+
+    cv2.putText(
+        canvas,
+        f"Selected count: {saved_counts[current_label]}",
+        (left_x, top_y + 32),
+        FONT,
+        0.55,
+        COLOR_WHITE,
+        1
+    )
+
+    if recording_label is not None:
+        status = f"RECORDING: {recording_label.replace('_', ' ')}"
+        color = COLOR_RED
+        progress = sequence_length / SEQUENCE_LENGTH
+        progress_label = f"Frames: {sequence_length}/{SEQUENCE_LENGTH}"
+
+    elif armed_label is not None:
+        status = f"GET READY: {armed_label.replace('_', ' ')}"
+        color = COLOR_YELLOW
+
+        if repeat_delay_remaining > 0:
+            progress = 0.0
+            progress_label = f"Next repeat starts in: {repeat_delay_remaining:.1f}s"
+        else:
+            progress = 1.0 - (countdown_remaining / COUNTDOWN_SECONDS)
+            progress_label = f"Recording starts in: {countdown_remaining:.1f}s"
+
+    else:
+        status = "READY TO COLLECT"
+        color = COLOR_GREEN
+        progress = 0.0
+        progress_label = "Press SPACE once or R for auto-repeat."
+
+    draw_wrapped_text(
+        canvas,
+        status,
+        mid_x,
+        top_y,
+        27,
+        0.62,
+        color,
+        2,
+        27
+    )
+
+    draw_progress_bar(
+        canvas,
+        mid_x,
+        top_y + 52,
+        350,
+        20,
+        progress,
+        color
+    )
+
+    cv2.putText(
+        canvas,
+        progress_label,
+        (mid_x, top_y + 95),
+        FONT,
+        0.45,
+        COLOR_WHITE,
+        1
+    )
+
+    cv2.putText(
+        canvas,
+        f"Repeat: {'ON' if repeat_mode else 'OFF'}",
+        (right_x, top_y),
+        FONT,
+        0.55,
+        COLOR_GREEN if repeat_mode else COLOR_MUTED,
+        1
+    )
+
+    draw_wrapped_text(
+        canvas,
+        message,
+        right_x,
+        top_y + 34,
+        28,
+        0.45,
+        COLOR_YELLOW,
+        1,
+        22
+    )
+
+
+def draw_dashboard(
     frame,
     labels,
     saved_counts,
@@ -238,186 +639,44 @@ def draw_ui(
     last_index,
     jump_text,
     auto_advance,
-    repeat_last_mode
+    repeat_mode,
+    repeat_delay_remaining,
+    message
 ):
-    total_labels = len(labels)
-    current_label = labels[current_index]
+    canvas = make_canvas()
+    paste_camera(canvas, frame)
 
-    # ============================================================
-    # COMPACT COUNTDOWN UI
-    # Hide the long instruction/phrase list while preparing.
-    # ============================================================
-    if armed_label is not None:
-        cv2.rectangle(frame, (20, 20), (960, 180), (0, 0, 0), -1)
-
-        cv2.putText(
-            frame,
-            f"GET READY: {armed_label}",
-            (40, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 255),
-            3
-        )
-
-        cv2.putText(
-            frame,
-            f"Recording starts in: {countdown_remaining:.1f}s",
-            (40, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            3
-        )
-
-        cv2.putText(
-            frame,
-            f"Auto-repeat: {'ON' if repeat_last_mode else 'OFF'} | Press R to stop auto-repeat",
-            (40, 160),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 255),
-            2
-        )
-
-        return
-
-    # ============================================================
-    # COMPACT RECORDING UI
-    # Hide instructions and phrase list while recording.
-    # ============================================================
-    if recording_label is not None:
-        cv2.rectangle(frame, (20, 20), (960, 180), (0, 0, 0), -1)
-
-        cv2.putText(
-            frame,
-            f"RECORDING: {recording_label}",
-            (40, 70),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            3
-        )
-
-        cv2.putText(
-            frame,
-            f"Frames: {sequence_length}/{SEQUENCE_LENGTH}",
-            (40, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 0, 255),
-            3
-        )
-
-        cv2.putText(
-            frame,
-            f"Auto-repeat: {'ON' if repeat_last_mode else 'OFF'} | Press R to stop after this capture",
-            (40, 160),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 255),
-            2
-        )
-
-        return
-
-    # ============================================================
-    # NORMAL FULL UI
-    # This returns after countdown/recording is done.
-    # ============================================================
-    cv2.rectangle(frame, (20, 20), (1210, 390), (0, 0, 0), -1)
-
-    current_page = current_index // PAGE_SIZE
-    total_pages = (total_labels + PAGE_SIZE - 1) // PAGE_SIZE
-
-    start = current_page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, total_labels)
-
-    cv2.putText(
-        frame,
-        "FSL Words / Phrases Data Collection - Index Mode",
-        (35, 55),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.75,
-        (0, 255, 0),
-        2
+    draw_phrase_list(
+        canvas=canvas,
+        labels=labels,
+        saved_counts=saved_counts,
+        current_index=current_index,
+        jump_text=jump_text,
+        auto_advance=auto_advance,
+        repeat_mode=repeat_mode,
+        last_index=last_index
     )
 
-    cv2.putText(
-        frame,
-        "SPACE = record once | R = auto-repeat ON/OFF | N/B = next/back | ]/[ = page | A = auto advance | ESC = quit",
-        (35, 90),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (0, 255, 255),
-        2
+    draw_bottom_panel(
+        canvas=canvas,
+        detected_hands=detected_hands,
+        current_label=labels[current_index],
+        saved_counts=saved_counts,
+        armed_label=armed_label,
+        countdown_remaining=countdown_remaining,
+        recording_label=recording_label,
+        sequence_length=sequence_length,
+        repeat_mode=repeat_mode,
+        repeat_delay_remaining=repeat_delay_remaining,
+        message=message
     )
 
-    cv2.putText(
-        frame,
-        "Type phrase number then ENTER to jump. Example: 57 ENTER",
-        (35, 120),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 255, 255),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"Selected: {current_index + 1}/{total_labels} - {current_label} | Count: {saved_counts[current_label]}",
-        (35, 155),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"Detected hands: {detected_hands} | Page: {current_page + 1}/{total_pages} | Jump: {jump_text} | Auto advance: {'ON' if auto_advance else 'OFF'} | Auto-repeat: {'ON' if repeat_last_mode else 'OFF'}",
-        (35, 185),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        (0, 255, 255),
-        2
-    )
-
-    y = 225
-
-    for i in range(start, end):
-        label = labels[i]
-        marker = ">>" if i == current_index else "  "
-        text = f"{marker} {i + 1:03d}. {label} ({saved_counts[label]})"
-
-        color = (0, 255, 255) if i == current_index else (0, 255, 0)
-
-        cv2.putText(
-            frame,
-            text,
-            (45, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2
-        )
-
-        y += 28
-
-    if last_index is not None:
-        last_label = labels[last_index]
-
-        cv2.putText(
-            frame,
-            f"Last recorded/repeated: {last_index + 1:03d}. {last_label}",
-            (620, 225),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 255),
-            2
-        )
+    return canvas
 
 
+# ============================================================
+# MAIN APP
+# ============================================================
 def main():
     labels = prepare_labels()
 
@@ -433,7 +692,7 @@ def main():
     print("")
     print("Controls:")
     print("SPACE = record selected phrase once")
-    print("R = auto-repeat last/selected phrase ON/OFF")
+    print("R = auto-repeat selected/last phrase ON/OFF")
     print("N = next phrase")
     print("B = previous phrase")
     print("] = next page")
@@ -465,7 +724,9 @@ def main():
 
     jump_text = ""
     auto_advance = False
-    repeat_last_mode = False
+    repeat_mode = False
+
+    message = "Select a phrase, then press SPACE to collect once or R for auto-repeat."
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -502,18 +763,25 @@ def main():
                     draw_hand(frame, hand_landmarks, w, h)
 
             countdown_remaining = 0
+            repeat_delay_remaining = 0
 
             # Countdown phase
             if armed_label is not None and recording_label is None:
                 elapsed = time.time() - armed_start_time
-                countdown_remaining = max(COUNTDOWN_SECONDS - elapsed, 0)
 
-                if elapsed >= COUNTDOWN_SECONDS:
-                    recording_label = armed_label
-                    recording_index = current_index
-                    armed_label = None
-                    sequence = []
-                    print(f"Recording phrase: {recording_label}")
+                if elapsed < 0:
+                    repeat_delay_remaining = abs(elapsed)
+                    countdown_remaining = COUNTDOWN_SECONDS
+                else:
+                    countdown_remaining = max(COUNTDOWN_SECONDS - elapsed, 0)
+
+                    if elapsed >= COUNTDOWN_SECONDS:
+                        recording_label = armed_label
+                        recording_index = current_index
+                        armed_label = None
+                        sequence = []
+                        message = f"Recording phrase: {recording_label}"
+                        print(f"Recording phrase: {recording_label}")
 
             # Recording phase
             if recording_label is not None:
@@ -522,10 +790,7 @@ def main():
 
                 if len(sequence) >= SEQUENCE_LENGTH:
                     features = sequence_to_features(sequence)
-
-                    with open(PHRASE_DATA_FILE, "a", newline="") as file:
-                        writer = csv.writer(file)
-                        writer.writerow([recording_label] + features)
+                    save_sample(recording_label, features)
 
                     saved_counts[recording_label] += 1
                     last_index = recording_index
@@ -538,24 +803,23 @@ def main():
                         f"Total: {saved_counts[saved_label]}"
                     )
 
+                    message = f"Saved {saved_label}. Total: {saved_counts[saved_label]}"
+
                     recording_label = None
                     recording_index = None
                     sequence = []
 
-                    if repeat_last_mode:
+                    if repeat_mode:
                         current_index = saved_index
                         armed_label = saved_label
-
-                        # Small pause before the next countdown starts.
-                        # This gives you time to reset your hands.
                         armed_start_time = time.time() + REPEAT_PAUSE_SECONDS
-
+                        message = f"Auto-repeat ON. Next capture for {armed_label}."
                         print(f"Auto-repeat ON. Next capture for: {armed_label}")
 
                     elif auto_advance:
                         current_index = min(current_index + 1, len(labels) - 1)
 
-            draw_ui(
+            dashboard = draw_dashboard(
                 frame=frame,
                 labels=labels,
                 saved_counts=saved_counts,
@@ -568,10 +832,12 @@ def main():
                 last_index=last_index,
                 jump_text=jump_text,
                 auto_advance=auto_advance,
-                repeat_last_mode=repeat_last_mode
+                repeat_mode=repeat_mode,
+                repeat_delay_remaining=repeat_delay_remaining,
+                message=message
             )
 
-            cv2.imshow("Collect FSL Phrase Data", frame)
+            cv2.imshow("Collect FSL Phrase Data", dashboard)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -590,15 +856,14 @@ def main():
                     pressed_key = ""
 
             # Allow R to stop auto-repeat even during countdown/recording.
-            # If recording is already in progress, it finishes the current sample
-            # but will not automatically start another one.
-            if pressed_key == "r" and repeat_last_mode:
-                repeat_last_mode = False
+            if pressed_key == "r" and repeat_mode:
+                repeat_mode = False
                 auto_advance = False
 
                 if armed_label is not None and recording_label is None:
                     armed_label = None
 
+                message = "Auto-repeat OFF."
                 print("Auto-repeat OFF.")
                 continue
 
@@ -613,9 +878,11 @@ def main():
 
                     if 1 <= target <= len(labels):
                         current_index = target - 1
-                        print(f"Selected phrase {target}: {labels[current_index]}")
+                        message = f"Selected phrase {target}: {labels[current_index]}"
+                        print(message)
                     else:
-                        print(f"Invalid phrase number: {target}")
+                        message = f"Invalid phrase number: {target}"
+                        print(message)
 
                     jump_text = ""
 
@@ -624,6 +891,7 @@ def main():
             # BACKSPACE clears typed jump number.
             if key == 8:
                 jump_text = jump_text[:-1]
+                message = f"Jump input: {jump_text}"
                 continue
 
             if pressed_key.isdigit():
@@ -632,50 +900,56 @@ def main():
                 if len(jump_text) > 3:
                     jump_text = jump_text[-3:]
 
+                message = f"Jump input: {jump_text}. Press ENTER."
+
             elif pressed_key == " ":
-                repeat_last_mode = False
+                repeat_mode = False
                 armed_label = labels[current_index]
                 armed_start_time = time.time()
+                message = f"Get ready for: {armed_label}"
                 print(f"Get ready for: {armed_label}")
 
             elif pressed_key == "n":
                 current_index = min(current_index + 1, len(labels) - 1)
                 jump_text = ""
+                message = f"Selected: {labels[current_index]}"
 
             elif pressed_key == "b":
                 current_index = max(current_index - 1, 0)
                 jump_text = ""
+                message = f"Selected: {labels[current_index]}"
 
             elif pressed_key == "]":
                 current_index = min(current_index + PAGE_SIZE, len(labels) - 1)
                 jump_text = ""
+                message = f"Page moved. Selected: {labels[current_index]}"
 
             elif pressed_key == "[":
                 current_index = max(current_index - PAGE_SIZE, 0)
                 jump_text = ""
+                message = f"Page moved. Selected: {labels[current_index]}"
 
             elif pressed_key == "r":
-                # Start auto-repeat.
-                # If there is a last recorded phrase, repeat that.
-                # Otherwise, repeat the currently selected phrase.
                 if last_index is not None:
                     current_index = last_index
 
-                repeat_last_mode = True
+                repeat_mode = True
                 auto_advance = False
 
                 armed_label = labels[current_index]
                 armed_start_time = time.time()
 
-                print(f"Auto-repeat ON for: {armed_label}")
+                message = f"Auto-repeat ON for: {armed_label}"
+                print(message)
 
             elif pressed_key == "a":
                 auto_advance = not auto_advance
 
                 if auto_advance:
-                    repeat_last_mode = False
+                    repeat_mode = False
 
-                print(f"Auto advance: {'ON' if auto_advance else 'OFF'}")
+                message = f"Auto advance: {'ON' if auto_advance else 'OFF'}"
+                print(message)
 
     cap.release()
     cv2.destroyAllWindows()

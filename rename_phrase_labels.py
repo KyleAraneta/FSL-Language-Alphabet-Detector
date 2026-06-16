@@ -5,8 +5,8 @@ DATA_FILE = os.path.join("data", "phrases", "fsl_phrase_data.csv")
 BACKUP_FILE = os.path.join("data", "phrases", "fsl_phrase_data_before_rename_backup.csv")
 
 RENAME_MAP = {
-    "AYOS_LANG_ITS_OKAY": "AYOS_LANG",
-    "SORRY_PASENSYA": "PASENSYA",
+    "AYOS_LANG__ITS_OKAY": "AYOS_LANG",
+    "SORRY__PASENSYA": "PASENSYA",
     "MALIGAYANG_PAGDATING": "MALIGAYANG_PAGDATING",
     "KAMI_AY_MGA": "KAMI_AY_MGA",
     "HINDI_KO_ALAM": "HINDI_KO_ALAM",
