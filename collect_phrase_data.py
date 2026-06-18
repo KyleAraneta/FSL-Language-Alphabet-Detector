@@ -20,7 +20,14 @@ CAMERA_INDEX = 0
 SEQUENCE_LENGTH = 30
 MAX_HANDS = 2
 
-COUNTDOWN_SECONDS = 3.0
+# Ready countdown before recording starts.
+COUNTDOWN_SECONDS = 1.0
+
+# Actual recording duration.
+# The collector records for 3.5 seconds, then resamples the captured frames
+# back to SEQUENCE_LENGTH so your CSV/model format stays compatible.
+RECORDING_SECONDS = 3.5
+
 REPEAT_PAUSE_SECONDS = 0.8
 PAGE_SIZE = 8
 
@@ -45,6 +52,7 @@ PHRASE_LABELS = [
     "AKO",
     "IKAW",
     "KAILAN",
+    "ANO",
     "SINO",
     "BAKIT",
     "SIGE",
@@ -52,6 +60,11 @@ PHRASE_LABELS = [
     "HINDI_KO_ALAM",
     "MASAYA_AKONG",
     "MAKILALA_KA",
+    "MGA_TAO",
+    "BINGI",
+    "MAHINA_ANG_PANDINIG",
+    "PANDINIG",
+    "ANONG_PANGALAN_MO?"
 ]
 
 # ============================================================
@@ -220,6 +233,25 @@ def get_two_hand_frame(all_hand_landmarks):
         hands.append(None)
 
     return hands[:MAX_HANDS]
+
+
+def resample_sequence(sequence, target_length=SEQUENCE_LENGTH):
+    if not sequence:
+        return []
+
+    if len(sequence) == target_length:
+        return sequence
+
+    if len(sequence) == 1:
+        return [sequence[0] for _ in range(target_length)]
+
+    indices = np.linspace(0, len(sequence) - 1, target_length)
+    resampled = []
+
+    for idx in indices:
+        resampled.append(sequence[int(round(idx))])
+
+    return resampled
 
 
 def sequence_to_features(sequence):
@@ -516,6 +548,7 @@ def draw_bottom_panel(
     armed_label,
     countdown_remaining,
     recording_label,
+    recording_elapsed,
     sequence_length,
     repeat_mode,
     repeat_delay_remaining,
@@ -551,8 +584,9 @@ def draw_bottom_panel(
     if recording_label is not None:
         status = f"RECORDING: {recording_label.replace('_', ' ')}"
         color = COLOR_RED
-        progress = sequence_length / SEQUENCE_LENGTH
-        progress_label = f"Frames: {sequence_length}/{SEQUENCE_LENGTH}"
+        progress = recording_elapsed / RECORDING_SECONDS
+        remaining = max(RECORDING_SECONDS - recording_elapsed, 0)
+        progress_label = f"Recording: {recording_elapsed:.1f}s / {RECORDING_SECONDS:.1f}s | Remaining: {remaining:.1f}s | Frames: {sequence_length}"
 
     elif armed_label is not None:
         status = f"GET READY: {armed_label.replace('_', ' ')}"
@@ -635,6 +669,7 @@ def draw_dashboard(
     armed_label,
     countdown_remaining,
     recording_label,
+    recording_elapsed,
     sequence_length,
     last_index,
     jump_text,
@@ -665,6 +700,7 @@ def draw_dashboard(
         armed_label=armed_label,
         countdown_remaining=countdown_remaining,
         recording_label=recording_label,
+        recording_elapsed=recording_elapsed,
         sequence_length=sequence_length,
         repeat_mode=repeat_mode,
         repeat_delay_remaining=repeat_delay_remaining,
@@ -720,6 +756,7 @@ def main():
 
     recording_label = None
     recording_index = None
+    recording_start_time = 0
     sequence = []
 
     jump_text = ""
@@ -764,6 +801,7 @@ def main():
 
             countdown_remaining = 0
             repeat_delay_remaining = 0
+            recording_elapsed = 0
 
             # Countdown phase
             if armed_label is not None and recording_label is None:
@@ -778,6 +816,7 @@ def main():
                     if elapsed >= COUNTDOWN_SECONDS:
                         recording_label = armed_label
                         recording_index = current_index
+                        recording_start_time = time.time()
                         armed_label = None
                         sequence = []
                         message = f"Recording phrase: {recording_label}"
@@ -785,39 +824,54 @@ def main():
 
             # Recording phase
             if recording_label is not None:
+                recording_elapsed = time.time() - recording_start_time
+
                 if current_two_hand_frame is not None:
                     sequence.append(current_two_hand_frame)
 
-                if len(sequence) >= SEQUENCE_LENGTH:
-                    features = sequence_to_features(sequence)
-                    save_sample(recording_label, features)
+                if recording_elapsed >= RECORDING_SECONDS:
+                    if not sequence:
+                        print(f"No hand frames captured for: {recording_label}. Sample not saved.")
+                        message = f"No hand frames captured for {recording_label}. Try again."
 
-                    saved_counts[recording_label] += 1
-                    last_index = recording_index
+                        recording_label = None
+                        recording_index = None
+                        recording_start_time = 0
+                        sequence = []
 
-                    saved_label = recording_label
-                    saved_index = recording_index
+                    else:
+                        fixed_sequence = resample_sequence(sequence, SEQUENCE_LENGTH)
+                        features = sequence_to_features(fixed_sequence)
+                        save_sample(recording_label, features)
 
-                    print(
-                        f"Saved phrase sample: {saved_label} | "
-                        f"Total: {saved_counts[saved_label]}"
-                    )
+                        saved_counts[recording_label] += 1
+                        last_index = recording_index
 
-                    message = f"Saved {saved_label}. Total: {saved_counts[saved_label]}"
+                        saved_label = recording_label
+                        saved_index = recording_index
 
-                    recording_label = None
-                    recording_index = None
-                    sequence = []
+                        print(
+                            f"Saved phrase sample: {saved_label} | "
+                            f"Total: {saved_counts[saved_label]} | "
+                            f"Captured frames: {len(sequence)}"
+                        )
 
-                    if repeat_mode:
-                        current_index = saved_index
-                        armed_label = saved_label
-                        armed_start_time = time.time() + REPEAT_PAUSE_SECONDS
-                        message = f"Auto-repeat ON. Next capture for {armed_label}."
-                        print(f"Auto-repeat ON. Next capture for: {armed_label}")
+                        message = f"Saved {saved_label}. Total: {saved_counts[saved_label]} | Captured frames: {len(sequence)}"
 
-                    elif auto_advance:
-                        current_index = min(current_index + 1, len(labels) - 1)
+                        recording_label = None
+                        recording_index = None
+                        recording_start_time = 0
+                        sequence = []
+
+                        if repeat_mode:
+                            current_index = saved_index
+                            armed_label = saved_label
+                            armed_start_time = time.time() + REPEAT_PAUSE_SECONDS
+                            message = f"Auto-repeat ON. Next capture for {armed_label}."
+                            print(f"Auto-repeat ON. Next capture for: {armed_label}")
+
+                        elif auto_advance:
+                            current_index = min(current_index + 1, len(labels) - 1)
 
             dashboard = draw_dashboard(
                 frame=frame,
@@ -828,6 +882,7 @@ def main():
                 armed_label=armed_label,
                 countdown_remaining=countdown_remaining,
                 recording_label=recording_label,
+                recording_elapsed=recording_elapsed,
                 sequence_length=len(sequence),
                 last_index=last_index,
                 jump_text=jump_text,

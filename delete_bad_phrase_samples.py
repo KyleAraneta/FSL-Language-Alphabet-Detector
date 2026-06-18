@@ -5,7 +5,7 @@ DATA_FILE = os.path.join("data", "phrases", "fsl_phrase_data.csv")
 BACKUP_FILE = os.path.join("data", "phrases", "fsl_phrase_data_before_delete_bad_samples.csv")
 
 # Change this if you want to delete another phrase later.
-TARGET_LABEL = "ANO"
+TARGET_LABEL = "ANONG_PANGALAN_MO?"
 
 if not os.path.exists(DATA_FILE):
     print("Phrase dataset not found.")

@@ -43,6 +43,10 @@ PHRASE_MOVEMENT_THRESHOLD = 0.00
 PHRASE_DETECTION_COOLDOWN_SECONDS = 0.35
 PHRASE_DISPLAY_HOLD_SECONDS = 2.50
 
+# Main.py phrase detection capture duration.
+# Change this to 4.0 if you want exactly 4 seconds.
+PHRASE_CAPTURE_SECONDS = 3.5
+
 PHRASE_READY_MESSAGE = "READY: Perform next phrase now"
 PHRASE_WAIT_MESSAGE = "WAIT: Resetting detector..."
 PHRASE_CAPTURE_MESSAGE = "CAPTURING: Keep signing..."
@@ -211,6 +215,7 @@ alphabet_history = deque(maxlen=10)
 number_history = deque(maxlen=10)
 phrase_history = deque(maxlen=5)
 
+# Keep this frame-based for alphabet J/Z motion only.
 motion_buffer = deque(maxlen=SEQUENCE_LENGTH)
 
 # ============================================================
@@ -256,6 +261,30 @@ def get_two_hand_frame(all_hand_landmarks):
         hands.append(None)
 
     return hands[:PHRASE_MAX_HANDS]
+
+
+def resample_phrase_sequence(sequence, target_length=SEQUENCE_LENGTH):
+    """
+    Main.py can now capture a phrase for 3.5 or 4 seconds.
+    This function compresses/expands those captured frames back to 30 frames
+    so it remains compatible with your trained phrase model.
+    """
+    if not sequence:
+        return []
+
+    if len(sequence) == target_length:
+        return sequence
+
+    if len(sequence) == 1:
+        return [sequence[0] for _ in range(target_length)]
+
+    indices = np.linspace(0, len(sequence) - 1, target_length)
+    resampled = []
+
+    for idx in indices:
+        resampled.append(sequence[int(round(idx))])
+
+    return resampled
 
 
 def sequence_to_features(sequence):
@@ -814,6 +843,10 @@ def main():
     displayed_phrase_time = 0
     phrase_cooldown_until = 0
 
+    # New phrase time-based capture state.
+    phrase_capture_start_time = 0
+    phrase_capture_sequence = []
+
     output_tokens = []
     output_types = []
 
@@ -847,6 +880,7 @@ def main():
             hand_landmarks = None
             all_hand_landmarks = []
             detected_hands = 0
+            current_phrase_frame = None
 
             if result.hand_landmarks:
                 all_hand_landmarks = result.hand_landmarks
@@ -860,7 +894,7 @@ def main():
                     motion_buffer.append(raw_landmarks(hand_landmarks))
 
                 elif current_mode == MODE_PHRASES:
-                    motion_buffer.append(get_two_hand_frame(all_hand_landmarks))
+                    current_phrase_frame = get_two_hand_frame(all_hand_landmarks)
 
             output_text = get_output_text(output_tokens)
             dashboard_frame = None
@@ -902,6 +936,8 @@ def main():
                                 displayed_phrase_label = ""
                                 displayed_phrase_time = 0
                                 phrase_cooldown_until = 0
+                                phrase_capture_start_time = 0
+                                phrase_capture_sequence = []
                                 last_added_letter = ""
                                 last_added_number = ""
                     else:
@@ -1095,81 +1131,106 @@ def main():
                 if phrase_classifier is None:
                     phrase_status = "Phrase model not found."
                     phrase_status_color = COLOR_RED
+                    phrase_capture_start_time = 0
+                    phrase_capture_sequence = []
 
                 elif not phrase_model_compatible:
                     phrase_status = "Phrase model is old/incompatible. Retrain phrase model."
                     phrase_status_color = COLOR_RED
+                    phrase_capture_start_time = 0
+                    phrase_capture_sequence = []
 
                 else:
                     if now < phrase_cooldown_until:
                         phrase_status = PHRASE_WAIT_MESSAGE
                         phrase_status_color = COLOR_YELLOW
                         motion_buffer.clear()
+                        phrase_capture_start_time = 0
+                        phrase_capture_sequence = []
 
                     elif hand_landmarks is None:
                         phrase_status = "READY: Show your hand to start."
                         phrase_status_color = COLOR_GREEN
                         motion_buffer.clear()
                         phrase_history.clear()
+                        phrase_capture_start_time = 0
+                        phrase_capture_sequence = []
 
-                    elif len(motion_buffer) < SEQUENCE_LENGTH:
-                        phrase_status = f"{PHRASE_CAPTURE_MESSAGE} {len(motion_buffer)}/{SEQUENCE_LENGTH}"
-                        phrase_status_color = COLOR_YELLOW
+                    else:
+                        if phrase_capture_start_time == 0:
+                            phrase_capture_start_time = now
+                            phrase_capture_sequence = []
 
-                    elif hand_landmarks is not None and len(motion_buffer) == SEQUENCE_LENGTH:
-                        phrase_status = PHRASE_ANALYZE_MESSAGE
-                        phrase_status_color = COLOR_YELLOW
+                        if current_phrase_frame is not None:
+                            phrase_capture_sequence.append(current_phrase_frame)
 
-                        sequence = list(motion_buffer)
-                        movement_score = calculate_phrase_movement(sequence)
+                        capture_elapsed = now - phrase_capture_start_time
 
-                        if movement_score >= PHRASE_MOVEMENT_THRESHOLD:
-                            raw_phrase_label, phrase_confidence = predict_phrase_motion(
-                                phrase_classifier,
-                                sequence
+                        if capture_elapsed < PHRASE_CAPTURE_SECONDS:
+                            phrase_status = (
+                                f"{PHRASE_CAPTURE_MESSAGE} "
+                                f"{capture_elapsed:.1f}s/{PHRASE_CAPTURE_SECONDS:.1f}s"
                             )
+                            phrase_status_color = COLOR_YELLOW
 
-                            raw_phrase_label = str(raw_phrase_label).upper().strip()
+                        else:
+                            phrase_status = PHRASE_ANALYZE_MESSAGE
+                            phrase_status_color = COLOR_YELLOW
 
-                            if phrase_confidence >= PHRASE_CONFIDENCE_THRESHOLD:
-                                if raw_phrase_label == "NONE":
-                                    phrase_history.clear()
-                                else:
-                                    displayed_phrase_label = raw_phrase_label
-                                    displayed_phrase_time = now
-                                    phrase_cooldown_until = now + PHRASE_DETECTION_COOLDOWN_SECONDS
-                                    phrase_history.clear()
+                            sequence = resample_phrase_sequence(phrase_capture_sequence, SEQUENCE_LENGTH)
 
-                                    if AUTO_ADD_PHRASES_TO_OUTPUT:
-                                        can_add_phrase = (
-                                            raw_phrase_label
-                                            and raw_phrase_label != "NONE"
-                                            and (
-                                                raw_phrase_label != last_added_phrase
-                                                or now - last_added_phrase_time >= PHRASE_ADD_COOLDOWN_SECONDS
-                                            )
-                                        )
+                            if sequence:
+                                movement_score = calculate_phrase_movement(sequence)
 
-                                        if can_add_phrase:
-                                            display_label_for_output = PHRASE_DISPLAY_RENAME_MAP.get(
-                                                raw_phrase_label,
-                                                raw_phrase_label
-                                            )
+                                if movement_score >= PHRASE_MOVEMENT_THRESHOLD:
+                                    raw_phrase_label, phrase_confidence = predict_phrase_motion(
+                                        phrase_classifier,
+                                        sequence
+                                    )
 
-                                            append_token(
-                                                output_tokens,
-                                                output_types,
-                                                display_label_for_output,
-                                                token_type="word"
-                                            )
+                                    raw_phrase_label = str(raw_phrase_label).upper().strip()
 
-                                            last_added_phrase = raw_phrase_label
-                                            last_added_phrase_time = now
-                                            last_added_letter = ""
-                                            last_added_number = ""
-                                            print(f"Added phrase to output: {display_label_for_output}")
+                                    if phrase_confidence >= PHRASE_CONFIDENCE_THRESHOLD:
+                                        if raw_phrase_label == "NONE":
+                                            phrase_history.clear()
+                                        else:
+                                            displayed_phrase_label = raw_phrase_label
+                                            displayed_phrase_time = now
+                                            phrase_cooldown_until = now + PHRASE_DETECTION_COOLDOWN_SECONDS
+                                            phrase_history.clear()
 
-                        motion_buffer.clear()
+                                            if AUTO_ADD_PHRASES_TO_OUTPUT:
+                                                can_add_phrase = (
+                                                    raw_phrase_label
+                                                    and raw_phrase_label != "NONE"
+                                                    and (
+                                                        raw_phrase_label != last_added_phrase
+                                                        or now - last_added_phrase_time >= PHRASE_ADD_COOLDOWN_SECONDS
+                                                    )
+                                                )
+
+                                                if can_add_phrase:
+                                                    display_label_for_output = PHRASE_DISPLAY_RENAME_MAP.get(
+                                                        raw_phrase_label,
+                                                        raw_phrase_label
+                                                    )
+
+                                                    append_token(
+                                                        output_tokens,
+                                                        output_types,
+                                                        display_label_for_output,
+                                                        token_type="word"
+                                                    )
+
+                                                    last_added_phrase = raw_phrase_label
+                                                    last_added_phrase_time = now
+                                                    last_added_letter = ""
+                                                    last_added_number = ""
+                                                    print(f"Added phrase to output: {display_label_for_output}")
+
+                            motion_buffer.clear()
+                            phrase_capture_start_time = 0
+                            phrase_capture_sequence = []
 
                     if displayed_phrase_label and now - displayed_phrase_time <= PHRASE_DISPLAY_HOLD_SECONDS:
                         display_label = PHRASE_DISPLAY_RENAME_MAP.get(displayed_phrase_label, displayed_phrase_label)
@@ -1208,6 +1269,8 @@ def main():
                 displayed_phrase_label = ""
                 displayed_phrase_time = 0
                 phrase_cooldown_until = 0
+                phrase_capture_start_time = 0
+                phrase_capture_sequence = []
 
                 last_added_letter = ""
                 last_added_number = ""
